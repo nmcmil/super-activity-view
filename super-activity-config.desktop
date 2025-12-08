@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Super Activity View Config
+Comment=Configure which key opens Activity View
+Exec=python3 /opt/super-activity-view/super-activity-config.py
+Icon=preferences-desktop-keyboard
+Terminal=false
+Type=Application
+Categories=Settings;GNOME;GTK;
+Keywords=super;activity;view;key;keyboard;

@@ -1,0 +1,23 @@
+[Unit]
+Description=Super Key Activity View Daemon
+Documentation=https://github.com/user/super-activity-view
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/super-activity-view/super_activity_daemon.py
+Restart=on-failure
+RestartSec=5
+
+# Run as root to access input devices
+# Alternatively, add user to 'input' group and run as user
+User=root
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=super-activity-view
+
+[Install]
+WantedBy=graphical-session.target
