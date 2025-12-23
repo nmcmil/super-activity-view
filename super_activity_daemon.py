@@ -31,7 +31,32 @@ except ImportError:
     print("Install with: pip install pyudev")
 
 # Config paths - check user config first, then system config
-USER_CONFIG_PATH = os.path.expanduser("~/.config/super-activity-view/config.json")
+# When running as root (systemd), we need to find the actual user's config
+def get_user_config_paths():
+    """Get possible user config paths, handling root execution."""
+    paths = []
+    
+    # If running as normal user
+    user_path = os.path.expanduser("~/.config/super-activity-view/config.json")
+    if not user_path.startswith("/root"):
+        paths.append(user_path)
+    
+    # Check SUDO_USER environment variable
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        paths.append(f"/home/{sudo_user}/.config/super-activity-view/config.json")
+    
+    # Check all users in /home/ (for systemd service running as root)
+    try:
+        for user_dir in os.listdir("/home"):
+            user_config = f"/home/{user_dir}/.config/super-activity-view/config.json"
+            if user_config not in paths:
+                paths.append(user_config)
+    except (PermissionError, FileNotFoundError):
+        pass
+    
+    return paths
+
 SYSTEM_CONFIG_PATH = "/etc/super-activity-view/config.json"
 
 # Key name to evdev code mapping
@@ -81,7 +106,9 @@ class SuperActivityDaemon:
         
         # Determine which config file to use (user config takes priority)
         config_path = None
-        for path in [USER_CONFIG_PATH, SYSTEM_CONFIG_PATH]:
+        # Check user configs first, then system config
+        search_paths = get_user_config_paths() + [SYSTEM_CONFIG_PATH]
+        for path in search_paths:
             if os.path.exists(path):
                 config_path = path
                 break
