@@ -15,6 +15,10 @@ import sys
 import time
 from pathlib import Path
 
+# Unbuffered output for systemd journal
+sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)
+sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', buffering=1)
+
 try:
     import evdev
     from evdev import ecodes, UInput
@@ -321,9 +325,11 @@ class SuperActivityDaemon:
         
         print("Device hotplug monitoring enabled (pyudev)")
         
+        loop = asyncio.get_event_loop()
+        
         while self.running:
-            # Check for udev events
-            device = monitor.poll(timeout=1.0)
+            # Run blocking poll in executor to not block the event loop
+            device = await loop.run_in_executor(None, lambda: monitor.poll(timeout=1.0))
             if device is None:
                 continue
                 
