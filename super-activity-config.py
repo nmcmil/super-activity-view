@@ -15,7 +15,7 @@ import os
 import subprocess
 import sys
 
-CONFIG_PATH = "/etc/super-activity-view/config.json"
+CONFIG_PATH = os.path.expanduser("~/.config/super-activity-view/config.json")
 SERVICE_NAME = "super-activity-view.service"
 
 # Key options for trigger and injection
@@ -34,9 +34,16 @@ class SuperActivityConfig(Adw.Application):
         )
         self.config = {
             "trigger_key": "KEY_LEFTMETA",
-            "injection_key": "KEY_LEFTCTRL"
+            "injection_key": "KEY_LEFTCTRL",
+            "tap_timeout": 0.5
         }
+        self._save_timeout_id = None  # For debouncing saves
         self.load_config()
+        
+        # Register actions for toast buttons
+        restart_action = Gio.SimpleAction.new("restart-service", None)
+        restart_action.connect("activate", self.on_restart_action)
+        self.add_action(restart_action)
         
     def load_config(self):
         """Load configuration from file."""
@@ -48,22 +55,15 @@ class SuperActivityConfig(Adw.Application):
             print(f"Could not load config: {e}")
     
     def save_config(self):
-        """Save configuration to file (requires sudo)."""
+        """Save configuration to user config file."""
         try:
             os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
             with open(CONFIG_PATH, 'w') as f:
                 json.dump(self.config, f, indent=2)
             return True
-        except PermissionError:
-            try:
-                config_json = json.dumps(self.config, indent=2)
-                subprocess.run([
-                    'pkexec', 'bash', '-c',
-                    f'mkdir -p /etc/super-activity-view && echo \'{config_json}\' > {CONFIG_PATH}'
-                ], check=True)
-                return True
-            except subprocess.CalledProcessError:
-                return False
+        except Exception as e:
+            print(f"Failed to save config: {e}")
+            return False
     
     def get_service_status(self):
         """Get the current service status."""
@@ -79,8 +79,9 @@ class SuperActivityConfig(Adw.Application):
     def control_service(self, action):
         """Start, stop, or restart the service."""
         try:
+            # Use systemctl directly - polkit rule handles authorization
             subprocess.run(
-                ['pkexec', 'systemctl', action, SERVICE_NAME],
+                ['systemctl', action, SERVICE_NAME],
                 check=True
             )
             return True
@@ -93,9 +94,13 @@ class SuperActivityConfig(Adw.Application):
         win.set_title("Super Activity View Configuration")
         win.set_default_size(450, 400)
         
+        # Toast overlay for notifications (doesn't affect window size)
+        self.toast_overlay = Adw.ToastOverlay()
+        win.set_content(self.toast_overlay)
+        
         # Main box
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        win.set_content(main_box)
+        self.toast_overlay.set_child(main_box)
         
         # Header bar
         header = Adw.HeaderBar()
@@ -160,12 +165,23 @@ class SuperActivityConfig(Adw.Application):
         injection_row.connect("notify::selected", self.on_injection_changed, key_names)
         injection_group.add(injection_row)
         
-        # Restart notice (hidden by default)
-        self.restart_notice = Adw.ActionRow()
-        self.restart_notice.set_title("⚠️ Restart Required")
-        self.restart_notice.set_subtitle("Click Restart below to apply changes")
-        self.restart_notice.set_visible(False)
-        injection_group.add(self.restart_notice)
+        # === Timing Group ===
+        timing_group = Adw.PreferencesGroup()
+        timing_group.set_title("Timing")
+        timing_group.set_description("Adjust how quickly you must tap the key")
+        content_box.append(timing_group)
+        
+        # Tap timeout spin row
+        timeout_row = Adw.SpinRow.new_with_range(0.05, 2.0, 0.05)
+        timeout_row.set_title("Tap Timeout")
+        timeout_row.set_subtitle("Max time between press and release (seconds)")
+        timeout_row.set_digits(2)
+        timeout_row.set_value(self.config.get("tap_timeout", 0.5))
+        timeout_row.connect("notify::value", self.on_timeout_changed)
+        timing_group.add(timeout_row)
+        
+        # Track if restart is needed
+        self.needs_restart = False
         
         # === Service Control Group ===
         service_group = Adw.PreferencesGroup()
@@ -177,6 +193,14 @@ class SuperActivityConfig(Adw.Application):
         self.status_row.set_title("Service Status")
         self.update_status_display()
         service_group.add(self.status_row)
+
+        # Launch at startup switch
+        startup_row = Adw.SwitchRow()
+        startup_row.set_title("Launch at Startup")
+        startup_row.set_subtitle("Automatically start service on boot")
+        startup_row.set_active(self.get_service_enabled_status())
+        startup_row.connect("notify::active", self.on_startup_toggled)
+        service_group.add(startup_row)
         
         # Control buttons row
         control_row = Adw.ActionRow()
@@ -209,7 +233,7 @@ class SuperActivityConfig(Adw.Application):
             new_key = KEY_OPTIONS[key_names[idx]]
             if new_key != self.config.get("trigger_key"):
                 self.config["trigger_key"] = new_key
-                self.restart_notice.set_visible(True)
+                self.show_restart_toast()
                 self.save_config()
     
     def on_injection_changed(self, row, param, key_names):
@@ -219,15 +243,61 @@ class SuperActivityConfig(Adw.Application):
             new_key = KEY_OPTIONS[key_names[idx]]
             if new_key != self.config.get("injection_key"):
                 self.config["injection_key"] = new_key
-                self.restart_notice.set_visible(True)
+                self.show_restart_toast()
                 self.save_config()
+    
+    def on_timeout_changed(self, row, param):
+        """Handle tap timeout value change (debounced)."""
+        new_value = round(row.get_value(), 2)
+        if new_value != self.config.get("tap_timeout"):
+            self.config["tap_timeout"] = new_value
+            self.needs_restart = True
+            
+            # Cancel any pending save
+            if self._save_timeout_id:
+                GLib.source_remove(self._save_timeout_id)
+            
+            # Debounce: save after 500ms of no changes
+            self._save_timeout_id = GLib.timeout_add(500, self._debounced_save)
+    
+    def _debounced_save(self):
+        """Actually save config after debounce delay."""
+        self._save_timeout_id = None
+        self.save_config()
+        if self.needs_restart:
+            self.show_restart_toast()
+        return False  # Don't repeat
+    
+    def show_restart_toast(self):
+        """Show a toast notification that restart is required (only once)."""
+        # Don't show duplicate toasts
+        if hasattr(self, '_restart_toast_shown') and self._restart_toast_shown:
+            return
+        
+        self._restart_toast_shown = True
+        self.needs_restart = True
+        toast = Adw.Toast(title="Restart required to apply changes")
+        toast.set_button_label("Restart Now")
+        toast.set_action_name("app.restart-service")
+        toast.set_timeout(5)
+        # Reset flag when toast is dismissed
+        toast.connect("dismissed", lambda t: setattr(self, '_restart_toast_shown', False))
+        self.toast_overlay.add_toast(toast)
+    
+    def on_restart_action(self, action, param):
+        """Handle restart action from toast button."""
+        self.on_service_action("restart")
     
     def on_service_action(self, action):
         """Handle service control button click."""
         if self.control_service(action):
             GLib.timeout_add(500, self.update_status_display)
             if action == "restart":
-                self.restart_notice.set_visible(False)
+                self.needs_restart = False
+                # Show success toast
+                toast = Adw.Toast(title="Service restarted successfully")
+                toast.set_timeout(2)
+                self.toast_overlay.add_toast(toast)
         else:
             self.show_message("Error", f"Failed to {action} service")
     
@@ -250,6 +320,33 @@ class SuperActivityConfig(Adw.Application):
             self.status_row.add_suffix(self.status_label)
         
         return False
+    
+    def get_service_enabled_status(self):
+        """Check if the service is enabled."""
+        try:
+            result = subprocess.run(
+                ['systemctl', 'is-enabled', SERVICE_NAME],
+                capture_output=True, text=True
+            )
+            return result.stdout.strip() == "enabled"
+        except Exception:
+            return False
+
+    def on_startup_toggled(self, row, param):
+        """Handle launch at startup toggle."""
+        is_enabled = row.get_active()
+        action = "enable" if is_enabled else "disable"
+        
+        try:
+            # enable/disable requires pkexec (not covered by our polkit rule)
+            subprocess.run(
+                ['pkexec', 'systemctl', action, SERVICE_NAME],
+                check=True
+            )
+        except subprocess.CalledProcessError:
+            # Revert switch if failed
+            row.set_active(not is_enabled)
+            self.show_message("Error", f"Failed to {action} startup service")
     
     def show_message(self, title, message):
         """Show a message dialog."""

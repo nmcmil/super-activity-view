@@ -5,6 +5,7 @@ Super Key Activity View Daemon
 Detects single SUPER key taps and opens GNOME Activity View via custom injection.
 Ignores SUPER+key combinations AND SUPER+scroll/click.
 Ignores Virtual Devices and known Proxy Devices to prevent conflicts.
+Supports dynamic device hotplug - automatically detects new keyboards/mice.
 """
 
 import asyncio
@@ -21,7 +22,17 @@ except ImportError:
     print("Error: evdev module not found. Install with: pip install evdev")
     sys.exit(1)
 
-CONFIG_PATH = "/etc/super-activity-view/config.json"
+try:
+    import pyudev
+    HAVE_PYUDEV = True
+except ImportError:
+    HAVE_PYUDEV = False
+    print("Warning: pyudev not found. Device hotplug detection disabled.")
+    print("Install with: pip install pyudev")
+
+# Config paths - check user config first, then system config
+USER_CONFIG_PATH = os.path.expanduser("~/.config/super-activity-view/config.json")
+SYSTEM_CONFIG_PATH = "/etc/super-activity-view/config.json"
 
 # Key name to evdev code mapping
 KEY_MAP = {
@@ -35,15 +46,21 @@ KEY_MAP = {
 class SuperActivityDaemon:
     """Daemon that monitors SUPER key, other keys, and mouse actions."""
     
-    # Maximum time (seconds) between press and release to be considered a "tap"
-    TAP_TIMEOUT = 0.5
+    # Default maximum time (seconds) between press and release to be considered a "tap"
+    DEFAULT_TAP_TIMEOUT = 0.5
+    
+    # How often to rescan for new devices (seconds) - fallback if pyudev unavailable
+    DEVICE_SCAN_INTERVAL = 5.0
     
     def __init__(self):
         self.super_pressed = False
         self.super_press_time = 0
         self.other_key_pressed = False
-        self.devices = []
+        self.devices = {}  # path -> device
+        self.device_tasks = {}  # path -> task
         self.ui = None
+        self.tap_timeout = self.DEFAULT_TAP_TIMEOUT
+        self.running = False
         
         # Load configuration
         self.load_config()
@@ -57,20 +74,31 @@ class SuperActivityDaemon:
             print("Make sure you are running as root or have access to /dev/uinput")
     
     def load_config(self):
-        """Load configuration from file."""
+        """Load configuration from file (user config takes priority)."""
         # Default configuration
         trigger_key = "KEY_LEFTMETA"
         injection_key = "KEY_LEFTCTRL"
         
-        try:
-            if os.path.exists(CONFIG_PATH):
-                with open(CONFIG_PATH, 'r') as f:
+        # Determine which config file to use (user config takes priority)
+        config_path = None
+        for path in [USER_CONFIG_PATH, SYSTEM_CONFIG_PATH]:
+            if os.path.exists(path):
+                config_path = path
+                break
+        
+        if config_path:
+            try:
+                with open(config_path, 'r') as f:
                     config = json.load(f)
                     trigger_key = config.get("trigger_key", trigger_key)
                     injection_key = config.get("injection_key", injection_key)
-                    print(f"Loaded config: trigger={trigger_key}, injection={injection_key}")
-        except (PermissionError, json.JSONDecodeError) as e:
-            print(f"Could not load config, using defaults: {e}")
+                    self.tap_timeout = config.get("tap_timeout", self.DEFAULT_TAP_TIMEOUT)
+                    print(f"Loaded config from {config_path}")
+                    print(f"  trigger={trigger_key}, injection={injection_key}, tap_timeout={self.tap_timeout}s")
+            except (PermissionError, json.JSONDecodeError) as e:
+                print(f"Could not load config from {config_path}: {e}")
+        else:
+            print("No config file found, using defaults")
         
         # Convert key names to evdev codes
         self.SUPER_KEYS = {KEY_MAP.get(trigger_key, ecodes.KEY_LEFTMETA)}
@@ -78,50 +106,68 @@ class SuperActivityDaemon:
         
         print(f"Listening for: {trigger_key}")
         print(f"Will inject: {injection_key}")
-        
+        print(f"Tap timeout: {self.tap_timeout}s")
+    
+    def is_valid_device(self, device):
+        """Check if a device should be monitored."""
+        try:
+            name = device.name
+            
+            # FILTER: Ignore our own device
+            if name == "Super Activity Daemon":
+                return False
+
+            # FILTER: Ignore Tiling Shell Proxy (Masquerades as USB)
+            if "Tiling Shell Proxy Device" in name:
+                return False
+            
+            # FILTER: Ignore BUS_VIRTUAL (0x06)
+            if device.info.bustype == 0x06:
+                return False
+                
+            caps = device.capabilities()
+            
+            # Check for Keyboard-like
+            is_keyboard = False
+            if ecodes.EV_KEY in caps:
+                keys = caps[ecodes.EV_KEY]
+                if ecodes.KEY_A in keys and ecodes.KEY_SPACE in keys:
+                    is_keyboard = True
+            
+            # Check for Mouse-like
+            is_mouse = ecodes.EV_REL in caps
+            
+            return is_keyboard or is_mouse
+        except (PermissionError, OSError):
+            return False
+    
+    def get_device_type(self, device):
+        """Get a human-readable device type."""
+        try:
+            caps = device.capabilities()
+            is_keyboard = ecodes.EV_KEY in caps and ecodes.KEY_A in caps.get(ecodes.EV_KEY, [])
+            is_mouse = ecodes.EV_REL in caps
+            if is_keyboard and is_mouse:
+                return "Combo"
+            elif is_keyboard:
+                return "Keyboard"
+            else:
+                return "Mouse/Other"
+        except:
+            return "Unknown"
         
     def find_input_devices(self):
         """Find keyboards and mice (filtering out virtual devices)."""
-        input_devices = []
+        input_devices = {}
         for path in evdev.list_devices():
             try:
                 device = evdev.InputDevice(path)
-                name = device.name
-                
-                # FILTER: Ignore our own device
-                if name == "Super Activity Daemon":
-                    continue
-
-                # FILTER: Ignore Tiling Shell Proxy (Masquerades as USB)
-                if "Tiling Shell Proxy Device" in name:
-                    # print(f"Ignoring Tiling Proxy: {name}")
-                    continue
-                
-                # FILTER: Ignore BUS_VIRTUAL (0x06)
-                if device.info.bustype == 0x06:
-                    # print(f"Ignoring virtual device: {name}")
-                    continue
-                    
-                caps = device.capabilities()
-                
-                # Check for Keyboard-like
-                is_keyboard = False
-                if ecodes.EV_KEY in caps:
-                    keys = caps[ecodes.EV_KEY]
-                    if ecodes.KEY_A in keys and ecodes.KEY_SPACE in keys:
-                        is_keyboard = True
-                
-                # Check for Mouse-like
-                is_mouse = False
-                if ecodes.EV_REL in caps:
-                     is_mouse = True
-                
-                if is_keyboard or is_mouse:
-                    input_devices.append(device)
-                    dtype = "Keyboard" if is_keyboard else "Mouse/Other"
-                    if is_keyboard and is_mouse: dtype = "Combo"
-                    print(f"Found {dtype}: {name} ({device.path})")
-                    
+                if self.is_valid_device(device):
+                    input_devices[path] = device
+                    dtype = self.get_device_type(device)
+                    print(f"Found {dtype}: {device.name} ({device.path})")
+                else:
+                    device.close()
             except (PermissionError, OSError):
                 pass
         return input_devices
@@ -163,7 +209,7 @@ class SuperActivityDaemon:
                     if self.super_pressed:
                         elapsed = time.time() - self.super_press_time
                         
-                        if not self.other_key_pressed and elapsed < self.TAP_TIMEOUT:
+                        if not self.other_key_pressed and elapsed < self.tap_timeout:
                             print(f"Clean SUPER tap detected ({elapsed:.3f}s)")
                             await self.trigger_activity_view()
                         else:
@@ -189,31 +235,141 @@ class SuperActivityDaemon:
     
     async def monitor_device(self, device):
         """Monitor a single device for events."""
+        path = device.path
         try:
             async for event in device.async_read_loop():
                 await self.handle_event(event)
         except OSError as e:
-            print(f"Device {device.name} disconnected: {e}")
+            print(f"Device disconnected: {device.name} ({path})")
+        finally:
+            # Clean up disconnected device
+            if path in self.devices:
+                del self.devices[path]
+            if path in self.device_tasks:
+                del self.device_tasks[path]
+            try:
+                device.close()
+            except:
+                pass
+    
+    def add_device(self, path):
+        """Add a new device to monitoring."""
+        if path in self.devices:
+            return  # Already monitoring
+        
+        try:
+            device = evdev.InputDevice(path)
+            if self.is_valid_device(device):
+                self.devices[path] = device
+                task = asyncio.create_task(self.monitor_device(device))
+                self.device_tasks[path] = task
+                dtype = self.get_device_type(device)
+                print(f"Hotplug: Added {dtype}: {device.name} ({path})")
+            else:
+                device.close()
+        except (PermissionError, OSError, FileNotFoundError):
+            pass
+    
+    def remove_device(self, path):
+        """Remove a device from monitoring."""
+        if path in self.device_tasks:
+            self.device_tasks[path].cancel()
+            del self.device_tasks[path]
+        if path in self.devices:
+            try:
+                self.devices[path].close()
+            except:
+                pass
+            del self.devices[path]
+            print(f"Hotplug: Removed device at {path}")
+    
+    async def watch_devices_pyudev(self):
+        """Watch for device changes using pyudev."""
+        context = pyudev.Context()
+        monitor = pyudev.Monitor.from_netlink(context)
+        monitor.filter_by(subsystem='input')
+        
+        # Make the monitor non-blocking
+        monitor.start()
+        
+        print("Device hotplug monitoring enabled (pyudev)")
+        
+        while self.running:
+            # Check for udev events
+            device = monitor.poll(timeout=1.0)
+            if device is None:
+                continue
+                
+            # Only care about event devices
+            if device.device_node and device.device_node.startswith('/dev/input/event'):
+                if device.action == 'add':
+                    # Small delay to let device initialize
+                    await asyncio.sleep(0.5)
+                    self.add_device(device.device_node)
+                elif device.action == 'remove':
+                    self.remove_device(device.device_node)
+    
+    async def watch_devices_poll(self):
+        """Fallback: periodically scan for new devices."""
+        print(f"Device hotplug monitoring enabled (polling every {self.DEVICE_SCAN_INTERVAL}s)")
+        
+        while self.running:
+            await asyncio.sleep(self.DEVICE_SCAN_INTERVAL)
+            
+            # Find current devices
+            current_paths = set(evdev.list_devices())
+            monitored_paths = set(self.devices.keys())
+            
+            # Add new devices
+            for path in current_paths - monitored_paths:
+                self.add_device(path)
+            
+            # Remove stale devices (handled by monitor_device when they disconnect)
     
     async def run(self):
-        """Main run loop."""
-        print("Super Activity View Daemon starting (Filtered Proxy Devices)...")
+        """Main run loop with dynamic device management."""
+        print("Super Activity View Daemon starting (with hotplug support)...")
+        self.running = True
+        
+        # Find initial devices
         self.devices = self.find_input_devices()
         
         if not self.devices:
-            print("No input devices found!")
-            sys.exit(1)
+            print("No input devices found! Will wait for devices to be connected...")
         
-        tasks = [self.monitor_device(device) for device in self.devices]
+        # Start monitoring existing devices
+        for path, device in self.devices.items():
+            task = asyncio.create_task(self.monitor_device(device))
+            self.device_tasks[path] = task
+        
+        # Start device hotplug watcher
+        if HAVE_PYUDEV:
+            hotplug_task = asyncio.create_task(self.watch_devices_pyudev())
+        else:
+            hotplug_task = asyncio.create_task(self.watch_devices_poll())
         
         try:
-            await asyncio.gather(*tasks)
+            # Keep running until cancelled
+            while self.running:
+                await asyncio.sleep(1)
+                
+                # If we have no devices, keep waiting
+                if not self.devices:
+                    continue
         except asyncio.CancelledError:
             print("Shutting down...")
         finally:
+            self.running = False
+            hotplug_task.cancel()
+            
+            # Cancel all device tasks
+            for task in self.device_tasks.values():
+                task.cancel()
+            
+            # Close all devices
             if self.ui:
                 self.ui.close()
-            for device in self.devices:
+            for device in self.devices.values():
                 try:
                     device.close()
                 except:

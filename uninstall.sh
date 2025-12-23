@@ -6,9 +6,9 @@ set -e
 INSTALL_DIR="/opt/super-activity-view"
 SERVICE_FILE="/etc/systemd/system/super-activity-view.service"
 
-echo "=================================="
+echo "======================================"
 echo "Super Activity View Daemon Uninstaller"
-echo "=================================="
+echo "======================================"
 
 # Check for root
 if [[ $EUID -ne 0 ]]; then
@@ -30,10 +30,28 @@ systemctl daemon-reload
 echo "Removing installation files..."
 rm -rf "$INSTALL_DIR"
 
+# Remove symlink
+echo "Removing command symlink..."
+rm -f /usr/local/bin/super-activity-config
+
+# Remove desktop entry
+echo "Removing desktop entry..."
+rm -f /usr/share/applications/super-activity-config.desktop
+
+# Remove polkit rule
+echo "Removing polkit rule..."
+rm -f /etc/polkit-1/rules.d/50-super-activity-view.rules
+
+# Remove sleep hook
+echo "Removing sleep/wake hook..."
+rm -f /usr/lib/systemd/system-sleep/super-activity-view
+
 echo ""
-echo "=================================="
+echo "======================================"
 echo "Uninstallation complete!"
-echo "=================================="
+echo "======================================"
 echo ""
 echo "The Super Activity View daemon has been removed."
-echo "Note: python3-evdev was not removed (may be used by other programs)."
+echo ""
+echo "Note: User config at ~/.config/super-activity-view/ was preserved."
+echo "      Delete it manually if you want to remove all traces."

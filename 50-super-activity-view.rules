@@ -1,0 +1,8 @@
+// Allow active users to manage super-activity-view service without password
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "super-activity-view.service" &&
+        subject.active && subject.local) {
+        return polkit.Result.YES;
+    }
+});
